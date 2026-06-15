@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>RADAR — Overhead Traffic</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" />
+  <link rel="stylesheet" href="radar.css" />
+  <!-- If you enabled CORS on the device's lighttpd, you can talk to it directly:
+       <script>window.ADSB_BASE = "http://192.168.2.74:8080";</script>
+       Otherwise leave unset and run serve.py (default ADSB_BASE = "/adsb"). -->
+</head>
+<body data-theme="green">
+  <div id="app">
+    <section id="scope-wrap">
+      <canvas id="scope"></canvas>
+
+      <!-- top status overlay -->
+      <div id="topbar">
+        <span id="status" class="status warn">CONNECTING…</span>
+        <span id="count" class="muted">— tracks</span>
+      </div>
+
+      <!-- radar-style zoom controls (touch friendly) -->
+      <div id="zoom-controls">
+        <button id="zoom-in" class="rbtn" aria-label="Zoom in">+</button>
+        <div id="range-val" class="range-readout">50 mi</div>
+        <button id="zoom-out" class="rbtn" aria-label="Zoom out">−</button>
+      </div>
+    </section>
+
+    <aside id="panel">
+      <h1 class="panel-title">CLOSEST MOVING TARGET</h1>
+      <div class="callsign-big" id="c-callsign">—</div>
+
+      <dl class="readout">
+        <dt>Flight No</dt><dd id="c-flight">—</dd>
+        <dt>Airline</dt><dd id="c-airline">—</dd>
+        <dt>Aircraft</dt><dd id="c-type">—</dd>
+        <dt>Reg</dt><dd id="c-reg">—</dd>
+        <dt>Altitude</dt><dd id="c-alt">—</dd>
+        <dt>Groundspeed</dt><dd id="c-gs">—</dd>
+        <dt>Route</dt><dd id="c-route">—</dd>
+        <dt>Range / Brg</dt><dd id="c-pos">—</dd>
+      </dl>
+
+      <div class="controls">
+        <div class="ctl-group">
+          <label>PHOSPHOR BURN</label>
+          <input type="range" id="phosphor" min="0" max="100" value="55" />
+        </div>
+        <div class="ctl-group">
+          <label>SCOPE COLOUR</label>
+          <div class="themes">
+            <button class="theme-btn t-green"  data-theme="green"  aria-label="Green"></button>
+            <button class="theme-btn t-orange" data-theme="orange" aria-label="Orange"></button>
+            <button class="theme-btn t-blue"   data-theme="blue"   aria-label="Blue"></button>
+          </div>
+        </div>
+      </div>
+
+      <p class="hint">Data: local ADS-B receiver · routes via adsbdb.com</p>
+    </aside>
+  </div>
+
+  <script src="radar.js"></script>
+</body>
+</html>

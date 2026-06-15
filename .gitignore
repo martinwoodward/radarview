@@ -1,0 +1,15 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Node (only used for local Playwright testing, never committed)
+node_modules/
+package.json
+package-lock.json
+
+# Test scaffolding / scratch
+shots/
+*.log
