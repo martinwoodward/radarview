@@ -124,6 +124,15 @@ body[data-theme="orange"] .t-orange,
 body[data-theme="blue"]   .t-blue { border-color: #fff; }
 
 .hint { font-size: 10px; color: var(--mid); opacity: 0.7; margin: 4px 0 0; }
+.legend {
+  display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px;
+  padding-top: 8px; border-top: 1px solid var(--grid);
+}
+.legend span {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--mid); letter-spacing: 0.04em;
+}
+.leg-ic { width: 17px; height: 17px; }
 
 /* ---- responsive: stack on narrow / portrait screens ---- */
 @media (max-width: 760px), (orientation: portrait) {

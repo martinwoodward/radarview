@@ -12,6 +12,8 @@ departure → arrival (3‑letter IATA), range & bearing.**
 Features:
 
 - Sweeping CRT beam, range rings, bearing spokes, phosphor trails, scanlines + vignette.
+- **Type-aware aircraft icons** — distinct silhouettes for jets, turboprops, military aircraft
+  and helicopters (with a legend in the panel), each rotated to its heading.
 - Touch‑friendly **zoom +/−** buttons cycling `12.5 / 25 / 50 / 100 / 200` miles (default **50**).
 - **Colour themes**: green, orange, blue.
 - Adjustable **phosphor burn** (afterglow persistence) slider.

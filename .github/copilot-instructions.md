@@ -32,6 +32,20 @@ plus a zero-dependency Python 3 launcher/proxy (`serve.py`). Keep it that way.
 - Plane icon: silhouette nose at `-y`, rotated by `track`; dot fallback when track null. Closest MOVING plane gets bigger icon + lock box. `isMoving()` excludes `alt_baro==="ground"` and `gs < MOVING_MIN_GS (50)`.
 - `placeLabels()` greedily nudges overlapping label boxes (closest placed first).
 
+## Aircraft icons (type classification)
+Each target is drawn with one of four silhouettes, chosen by `classifyIcon(rec)` → `rec.iconKind`:
+- **jet** (default/unknown), **turboprop**, **military**, **helicopter**. Path functions:
+  `pathJet/pathProp/pathMil/pathHeli(g, s)`; dispatcher `drawPlaneIcon(g, x, y, heading, s, fill, kind)`
+  takes the canvas context `g` (so the panel legend can reuse it via `drawLegend()`).
+- Classification priority: military (`dbFlags & 1`, or ICAO type in the curated `MIL_TYPES` set)
+  → helicopter (ICAO descriptor 1st char `H`/`G`/`T`, or ADS-B emitter category `A7`)
+  → engine type from the ICAO descriptor 3rd char (`J`=jet, `T`=turboprop, `P`/`E`=piston→prop icon)
+  → fallback: emitter category `A3`–`A6` ⇒ jet.
+- The descriptor code (e.g. `L2J`) comes from `rec.typeData.desc` on the local feed, or is looked
+  up by type code `t` in the ICAO type table (`typeToDesc`) for internet feeds.
+- `rec.category` (emitter cat) and `rec.mil` (`dbFlags`) are captured in `poll()`; `classifyIcon`
+  is re-run when the local DB resolves a type. Legend swatches are redrawn on theme change.
+
 ## serve.py gotchas
 - `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`. Device URL is a **class attr** `Handler.device` — do NOT use a module global (causes "global used prior to declaration" SyntaxError).
 - `/adsb/*` proxy blocks `..` and absolute paths, validates netloc.

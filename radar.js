@@ -199,6 +199,8 @@ async function poll() {
       rec.callsign = (a.flight || "").trim();
       rec.altRaw = a.alt_baro;
       rec.gs = typeof a.gs === "number" ? a.gs : null;
+      rec.category = a.category || rec.category || null;
+      if (typeof a.dbFlags === "number") rec.mil = !!(a.dbFlags & 1);
       rec.track = typeof a.track === "number" ? a.track
         : (typeof a.true_heading === "number" ? a.true_heading : null);
       rec.lat = a.lat; rec.lon = a.lon;
@@ -230,6 +232,7 @@ async function poll() {
       } else {
         resolveHex(hex);
       }
+      classifyIcon(rec);
       if (rec.callsign) resolveRoute(rec.callsign);
     }
     // prune
@@ -269,6 +272,73 @@ async function loadTypeTable() {
   return typeTable;
 }
 
+// ---- aircraft kind classification (for the icon) --------------------------
+// ICAO type designators that are (almost always) military, so we can show a
+// fighter/military icon even when the engine descriptor says "jet/turboprop".
+const MIL_TYPES = new Set([
+  // fast jets
+  "F15", "F16", "F18", "F22", "F35", "EUFI", "TYP", "TOR", "RFAL", "GR4", "A10",
+  "F117", "J39", "M2000", "MIR2", "MG29", "MG31", "S37", "SU25", "SU27", "SU30",
+  "SU34", "SU57", "T50", "JF17", "F2", "F4", "F5", "AV8B", "HARR", "HAWK", "T38",
+  "T6", "PC21", "PC9", "TUC", "TEX2", "L39",
+  // military transport / tanker / maritime / AEW
+  "C130", "C30J", "K35R", "KC135", "KC10", "KC30", "A400", "C17", "C5M", "C5",
+  "C160", "C27J", "C295", "CN35", "P8", "P3", "NIM", "A124", "AN12", "AN24",
+  "AN26", "AN70", "IL76", "IL78", "E3CF", "E3TF", "E2", "E6", "E8", "C2", "U2",
+  "B52", "B1", "B2", "RC135", "K35E",
+  // military helicopters
+  "H60", "UH60", "S70", "H64", "AH64", "H47", "CH47", "H53", "CH53", "H46",
+  "LYNX", "WG13", "MERL", "EH10", "EH01", "AS32", "PUMA", "NH90", "H1", "AH1",
+  "UH1", "TIGR", "EC65", "A129", "KA50", "KA52", "MI24", "MI28", "MI8", "MI17",
+  // military UAV
+  "RQ4", "MQ9", "MQ1", "MQ4", "GHWK",
+]);
+
+function descToKind(code) {
+  // ICAO descriptor code like "L2J" (type / #engines / engine kind)
+  if (!code || !/^[A-Z][0-9C][A-Z]$/.test(code)) return null;
+  if (code[0] === "H" || code[0] === "G" || code[0] === "T") return "helicopter"; // H=heli, G=gyro, T=tiltrotor
+  switch (code[2]) {
+    case "J": return "jet";
+    case "T": return "turboprop";
+    case "P": return "piston";
+    case "E": return "piston";       // electric prop — draw as prop
+    default: return null;
+  }
+}
+
+// resolve descriptor code from a type designator via the ICAO type table
+async function typeToDesc(t) {
+  if (!t) return null;
+  const tt = await loadTypeTable();
+  const e = tt[t.toUpperCase()];
+  return e && e.desc ? e.desc : null;
+}
+
+// decide which icon to use for a record; stored on rec.iconKind (async).
+async function classifyIcon(rec) {
+  const td = rec.typeData || {};
+  const t = td.t || null;
+  // military wins (so a C-130 reads "military", not "turboprop")
+  if (rec.mil || (t && MIL_TYPES.has(t.toUpperCase()))) {
+    // distinguish military helicopters
+    let code = (td.desc && /^[A-Z][0-9C][A-Z]$/.test(td.desc)) ? td.desc : await typeToDesc(t);
+    rec.iconKind = (descToKind(code) === "helicopter" || rec.category === "A7") ? "helicopter" : "military";
+    return;
+  }
+  // ADS-B emitter category A7 == rotorcraft
+  if (rec.category === "A7") { rec.iconKind = "helicopter"; return; }
+  // engine type from the ICAO descriptor (local desc is the code; else look up by t)
+  let code = (td.desc && /^[A-Z][0-9C][A-Z]$/.test(td.desc)) ? td.desc : await typeToDesc(t);
+  const kind = descToKind(code);
+  if (kind) { rec.iconKind = kind; return; }
+  // fallback by emitter category: large/heavy => jet
+  if (rec.category === "A3" || rec.category === "A4" || rec.category === "A5" || rec.category === "A6") {
+    rec.iconKind = "jet"; return;
+  }
+  // leave whatever we had (default handled at draw time)
+}
+
 async function resolveHex(hex) {
   if (hexCache.has(hex) || hexInflight.has(hex)) return;
   hexInflight.add(hex);
@@ -288,7 +358,7 @@ async function resolveHex(hex) {
       const out = { r: found.r || null, t: found.t || null, desc: null };
       if (out.t) { const tt = await loadTypeTable(); if (tt[out.t.toUpperCase()]) out.desc = tt[out.t.toUpperCase()].desc; }
       hexCache.set(hex, out);
-      const rec = state.aircraft.get(hex); if (rec) rec.typeData = out;
+      const rec = state.aircraft.get(hex); if (rec) { rec.typeData = out; classifyIcon(rec); }
     } else {
       hexCache.set(hex, null);
     }
@@ -484,31 +554,136 @@ function fmtAlt(raw) {
   return raw.toLocaleString() + " ft";
 }
 
-// directional plane silhouette (nose points "up" = -y, then rotated to heading)
-function drawPlaneIcon(x, y, headingDeg, s, fill) {
-  ctx.save();
-  ctx.translate(x, y);
-  if (headingDeg != null) ctx.rotate(rad(headingDeg));
-  ctx.beginPath();
-  ctx.moveTo(0, -s * 1.05);          // nose
-  ctx.lineTo(s * 0.16, -s * 0.30);
-  ctx.lineTo(s * 0.98, s * 0.30);    // right wing
-  ctx.lineTo(s * 0.98, s * 0.48);
-  ctx.lineTo(s * 0.16, s * 0.16);
-  ctx.lineTo(s * 0.14, s * 0.74);
-  ctx.lineTo(s * 0.52, s * 1.02);    // right tailplane
-  ctx.lineTo(s * 0.52, s * 1.14);
-  ctx.lineTo(0, s * 0.86);
-  ctx.lineTo(-s * 0.52, s * 1.14);   // left tailplane
-  ctx.lineTo(-s * 0.52, s * 1.02);
-  ctx.lineTo(-s * 0.14, s * 0.74);
-  ctx.lineTo(-s * 0.16, s * 0.16);
-  ctx.lineTo(-s * 0.98, s * 0.48);   // left wing
-  ctx.lineTo(-s * 0.98, s * 0.30);
-  ctx.lineTo(-s * 0.16, -s * 0.30);
-  ctx.closePath();
-  ctx.fillStyle = fill; ctx.fill();
-  ctx.restore();
+// ---- aircraft icons (nose points "up" = -y, then rotated to heading) -------
+// Airliner / generic jet: swept wings.
+function pathJet(g, s) {
+  g.beginPath();
+  g.moveTo(0, -s * 1.05);          // nose
+  g.lineTo(s * 0.16, -s * 0.30);
+  g.lineTo(s * 0.98, s * 0.30);    // right wing (swept)
+  g.lineTo(s * 0.98, s * 0.48);
+  g.lineTo(s * 0.16, s * 0.16);
+  g.lineTo(s * 0.14, s * 0.74);
+  g.lineTo(s * 0.52, s * 1.02);    // right tailplane
+  g.lineTo(s * 0.52, s * 1.14);
+  g.lineTo(0, s * 0.86);
+  g.lineTo(-s * 0.52, s * 1.14);   // left tailplane
+  g.lineTo(-s * 0.52, s * 1.02);
+  g.lineTo(-s * 0.14, s * 0.74);
+  g.lineTo(-s * 0.16, s * 0.16);
+  g.lineTo(-s * 0.98, s * 0.48);   // left wing
+  g.lineTo(-s * 0.98, s * 0.30);
+  g.lineTo(-s * 0.16, -s * 0.30);
+  g.closePath();
+  g.fill();
+}
+
+// Turboprop / piston: straight (unswept) high-aspect wings + nose prop disc.
+function pathProp(g, s) {
+  g.beginPath();
+  g.moveTo(0, -s * 0.98);          // nose
+  g.lineTo(s * 0.13, -s * 0.55);
+  g.lineTo(s * 0.13, -s * 0.05);
+  g.lineTo(s * 1.05, s * 0.02);    // straight right wing
+  g.lineTo(s * 1.05, s * 0.20);
+  g.lineTo(s * 0.13, s * 0.30);
+  g.lineTo(s * 0.13, s * 0.78);
+  g.lineTo(s * 0.46, s * 0.92);    // right tailplane
+  g.lineTo(s * 0.46, s * 1.06);
+  g.lineTo(0, s * 0.84);
+  g.lineTo(-s * 0.46, s * 1.06);   // left tailplane
+  g.lineTo(-s * 0.46, s * 0.92);
+  g.lineTo(-s * 0.13, s * 0.78);
+  g.lineTo(-s * 0.13, s * 0.30);
+  g.lineTo(-s * 1.05, s * 0.20);   // straight left wing
+  g.lineTo(-s * 1.05, s * 0.02);
+  g.lineTo(-s * 0.13, -s * 0.05);
+  g.lineTo(-s * 0.13, -s * 0.55);
+  g.closePath();
+  g.fill();
+  // propeller disc at the nose
+  g.lineWidth = Math.max(1, s * 0.10);
+  g.beginPath();
+  g.moveTo(-s * 0.34, -s * 1.02);
+  g.lineTo(s * 0.34, -s * 1.02);
+  g.stroke();
+}
+
+// Military fast jet: sharp delta with twin tail fins.
+function pathMil(g, s) {
+  g.beginPath();
+  g.moveTo(0, -s * 1.18);          // long pointed nose
+  g.lineTo(s * 0.10, -s * 0.30);
+  g.lineTo(s * 0.86, s * 0.62);    // swept delta right
+  g.lineTo(s * 0.74, s * 0.78);
+  g.lineTo(s * 0.12, s * 0.34);
+  g.lineTo(s * 0.12, s * 0.78);
+  g.lineTo(s * 0.40, s * 1.12);    // right tail fin
+  g.lineTo(s * 0.24, s * 1.16);
+  g.lineTo(0, s * 0.92);
+  g.lineTo(-s * 0.24, s * 1.16);   // left tail fin
+  g.lineTo(-s * 0.40, s * 1.12);
+  g.lineTo(-s * 0.12, s * 0.78);
+  g.lineTo(-s * 0.12, s * 0.34);
+  g.lineTo(-s * 0.74, s * 0.78);   // swept delta left
+  g.lineTo(-s * 0.86, s * 0.62);
+  g.lineTo(-s * 0.10, -s * 0.30);
+  g.closePath();
+  g.fill();
+}
+
+// Helicopter: fuselage + tail boom + rotor disc with two blades.
+function pathHeli(g, s) {
+  // fuselage
+  g.beginPath();
+  g.moveTo(0, -s * 0.62);
+  g.bezierCurveTo(s * 0.40, -s * 0.55, s * 0.38, s * 0.10, s * 0.20, s * 0.34);
+  g.bezierCurveTo(s * 0.10, s * 0.46, -s * 0.10, s * 0.46, -s * 0.20, s * 0.34);
+  g.bezierCurveTo(-s * 0.38, s * 0.10, -s * 0.40, -s * 0.55, 0, -s * 0.62);
+  g.closePath();
+  g.fill();
+  // tail boom
+  g.beginPath();
+  g.moveTo(-s * 0.07, s * 0.20);
+  g.lineTo(s * 0.07, s * 0.20);
+  g.lineTo(s * 0.05, s * 1.06);
+  g.lineTo(-s * 0.05, s * 1.06);
+  g.closePath();
+  g.fill();
+  // tail rotor
+  g.lineWidth = Math.max(1, s * 0.09);
+  g.beginPath();
+  g.moveTo(-s * 0.22, s * 1.02);
+  g.lineTo(s * 0.10, s * 1.10);
+  g.stroke();
+  // main rotor disc + blades
+  g.save();
+  g.globalAlpha *= 0.6;
+  g.beginPath();
+  g.arc(0, -s * 0.08, s * 1.02, 0, Math.PI * 2);
+  g.stroke();
+  g.restore();
+  g.beginPath();
+  g.moveTo(-s * 0.95, -s * 0.78);
+  g.lineTo(s * 0.95, s * 0.62);
+  g.moveTo(s * 0.95, -s * 0.78);
+  g.lineTo(-s * 0.95, s * 0.62);
+  g.stroke();
+}
+
+function drawPlaneIcon(g, x, y, headingDeg, s, fill, kind) {
+  g.save();
+  g.translate(x, y);
+  if (headingDeg != null) g.rotate(rad(headingDeg));
+  g.fillStyle = fill; g.strokeStyle = fill; g.lineCap = "round";
+  switch (kind) {
+    case "helicopter": pathHeli(g, s); break;
+    case "military": pathMil(g, s); break;
+    case "turboprop":
+    case "piston": pathProp(g, s); break;
+    default: pathJet(g, s); break;   // jet / unknown
+  }
+  g.restore();
 }
 
 function boxesOverlap(a, b) {
@@ -560,7 +735,7 @@ function drawAircraft(now) {
     // plane icon, pointing along its track
     const fill = stale ? hexA(col.mid, 0.55) : col.hot;
     const s = isClosest ? 10 : 7;
-    if (rec.track != null) drawPlaneIcon(px.x, px.y, rec.track, s, fill);
+    if (rec.track != null || rec.iconKind) drawPlaneIcon(ctx, px.x, px.y, rec.track, s, fill, rec.iconKind);
     else { ctx.fillStyle = fill; ctx.beginPath(); ctx.arc(px.x, px.y, s * 0.45, 0, Math.PI * 2); ctx.fill(); }
     if (isClosest) {
       ctx.strokeStyle = col.hot; ctx.lineWidth = 1.5;
@@ -661,6 +836,21 @@ function updateHud(now) {
 function applyTheme() {
   document.body.dataset.theme = state.theme;
   coastKey = "";
+  drawLegend();
+}
+
+// render the icon legend swatches in the current theme colour
+function drawLegend() {
+  const hot = themeColors().hot;
+  document.querySelectorAll(".leg-ic").forEach(cv => {
+    const g = cv.getContext("2d");
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const size = 34;
+    cv.width = size * dpr; cv.height = size * dpr;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, size, size);
+    drawPlaneIcon(g, size / 2, size / 2, 0, 11, hot, cv.dataset.kind);
+  });
 }
 function zoom(dir) {
   const prev = state.rangeIdx;
