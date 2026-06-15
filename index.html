@@ -47,6 +47,14 @@
 
       <div class="controls">
         <div class="ctl-group">
+          <label>FEED SOURCE</label>
+          <select id="feed-select" class="feed-select"></select>
+          <div id="rapidkey-wrap" class="rapidkey-wrap" style="display:none">
+            <input id="rapid-key" class="key-input" type="password" autocomplete="off"
+                   placeholder="RapidAPI key for ADSBExchange" />
+          </div>
+        </div>
+        <div class="ctl-group">
           <label>PHOSPHOR BURN</label>
           <input type="range" id="phosphor" min="0" max="100" value="55" />
         </div>

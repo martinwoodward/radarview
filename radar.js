@@ -1,20 +1,81 @@
-/* Radar View — animated CRT radar scope fed by a local PiAware/SkyAware ADS-B receiver.
+/* Radar View — animated CRT radar scope for live ADS-B aircraft.
  *
- * Data sources:
- *   - <ADSB_BASE>/data/aircraft.json   live positions/altitude/groundspeed/track
- *   - <ADSB_BASE>/data/receiver.json   receiver lat/lon
- *   - <ADSB_BASE>/db/<prefix>.json     hex -> {r:registration, t:typecode} (hierarchical)
- *   - <ADSB_BASE>/db/aircraft_types/icao_aircraft_types.json   typecode -> {desc,wtc}
- *   - https://api.adsbdb.com/v0/callsign/<CALLSIGN>  flight number, airline, dep/arr (IATA)
+ * FEEDS (see FEEDS registry below) are switchable at runtime from the panel:
+ *   - "local"          a PiAware/SkyAware/dump1090-fa receiver (aircraft.json format)
+ *   - "airplaneslive"  https://api.airplanes.live  (free, CORS-enabled, global)
+ *   - "adsblol"        https://api.adsb.lol         (free; no CORS -> via serve.py proxy)
+ *   - "adsbexchange"   ADSBExchange via RapidAPI    (needs your RapidAPI key)
  *
- * ADSB_BASE: default "/adsb" works behind the bundled serve.py proxy. If you enable CORS
- * on the device's lighttpd you can point straight at it, e.g.:
- *   <script>window.ADSB_BASE="http://192.168.2.74:8080"</script>  (before radar.js)
+ * Enrichment (all feeds): https://api.adsbdb.com  -> flight number, airline, dep/arr (IATA).
+ * Local feed also resolves type/registration from the receiver's own /db/ database; the
+ * internet feeds already include registration (r) and ICAO type (t) inline.
+ *
+ * Quick config:
+ *   - ADSB_BASE: base URL of the local receiver data (default "/adsb" via serve.py).
+ *       To talk to a CORS-enabled device directly, set window.ADSB_BASE before this script.
+ *   - HOME: fallback map centre for internet feeds when no local receiver is available.
+ *   - DEFAULT_FEED: which feed to start on.
+ *   - window.RADAR_HOME = {lat,lon} overrides HOME; selection is remembered in localStorage.
  */
 "use strict";
 
 const ADSB_BASE = (window.ADSB_BASE || "/adsb").replace(/\/$/, "");
 const ADSBDB = "https://api.adsbdb.com/v0";
+const FEED_PROXY = "/feed";   // serve.py allow-listed proxy for CORS-less internet feeds
+
+// Fallback scope centre (used by internet feeds if there is no local receiver to ask).
+const HOME = window.RADAR_HOME || { lat: 54.76, lon: -6.35 };
+const DEFAULT_FEED = "local";
+
+// ---- feed registry --------------------------------------------------------
+// Each feed: kind ("dump1090" local | "readsb" internet), how to build the request,
+// which JSON key holds the aircraft array, and whether registration/type come inline.
+const FEEDS = {
+  local: {
+    label: "Local receiver",
+    kind: "dump1090",
+    array: "aircraft",
+    inlineDb: false,
+    usesLocalReceiver: true,
+    build: () => ({ url: `${ADSB_BASE}/data/aircraft.json` }),
+  },
+  airplaneslive: {
+    label: "airplanes.live (internet)",
+    kind: "readsb",
+    array: "ac",
+    inlineDb: true,
+    build: (lat, lon, nm) => ({
+      url: `https://api.airplanes.live/v2/point/${lat.toFixed(4)}/${lon.toFixed(4)}/${clampNm(nm)}`,
+    }),
+  },
+  adsblol: {
+    label: "adsb.lol (internet)",
+    kind: "readsb",
+    array: "ac",
+    inlineDb: true,
+    proxy: true, // adsb.lol sends no CORS header, so route through serve.py
+    build: (lat, lon, nm) => ({
+      url: `https://api.adsb.lol/v2/lat/${lat.toFixed(4)}/lon/${lon.toFixed(4)}/dist/${clampNm(nm)}`,
+    }),
+  },
+  adsbexchange: {
+    label: "ADSBExchange (RapidAPI key)",
+    kind: "readsb",
+    array: "ac",
+    inlineDb: true,
+    proxy: true, // forward via serve.py so the key/host headers are applied reliably
+    needsKey: true,
+    build: (lat, lon, nm) => ({
+      url: `https://adsbexchange-com1.p.rapidapi.com/v2/lat/${lat.toFixed(4)}/lon/${lon.toFixed(4)}/dist/${clampNm(nm)}/`,
+      headers: {
+        "X-RapidAPI-Key": state.rapidKey || "",
+        "X-RapidAPI-Host": "adsbexchange-com1.p.rapidapi.com",
+      },
+    }),
+  },
+};
+
+function clampNm(nm) { return Math.max(1, Math.min(250, Math.ceil(nm))); }
 
 // ---- tunables -------------------------------------------------------------
 const RANGES_MI = [12.5, 25, 50, 100, 200];   // zoom steps
@@ -26,6 +87,7 @@ const MOVING_MIN_GS = 50;                        // kts; below this a target cou
 const DR_MAX_SEC = 4;                            // cap dead-reckoning extrapolation
 const MI_PER_DEG_LAT = 69.172;                   // statute miles per degree latitude
 const KT_TO_MI_PER_SEC = 1.15078 / 3600;         // knots -> statute miles/second
+const MI_TO_NM = 1 / 1.15078;                    // statute miles -> nautical miles
 
 const THEMES = {
   green:  { dim: "#0a3d12", mid: "#1f9c3a", hot: "#7dff8e", base: "#33ff66" },
@@ -34,8 +96,12 @@ const THEMES = {
 };
 
 // ---- state ----------------------------------------------------------------
+const LS = window.localStorage;
 const state = {
-  receiver: { lat: 54.76, lon: -6.35 },
+  feedId: (LS && LS.getItem("radar.feed")) || DEFAULT_FEED,
+  rapidKey: (LS && LS.getItem("radar.rapidkey")) || "",
+  receiver: { lat: HOME.lat, lon: HOME.lon },  // scope centre
+  homeKnown: false,                            // set true once a local receiver is located
   aircraft: new Map(),     // hex -> record
   rangeIdx: DEFAULT_RANGE_IDX,
   theme: "green",
@@ -46,6 +112,7 @@ const state = {
   pollError: null,
   coast: null,             // {coast:[[ [lon,lat],.. ]], lake:[...] }
 };
+if (!FEEDS[state.feedId]) state.feedId = DEFAULT_FEED;
 
 const dbShardCache = new Map();   // prefix -> data (or null)
 const dbShardInflight = new Map();
@@ -87,27 +154,44 @@ function compass(b) {
 }
 
 // ---- data polling ---------------------------------------------------------
+// Locate the scope centre. Local feed asks the receiver; internet feeds use HOME
+// (or the last known local receiver position, so switching keeps you centred).
 async function loadReceiver() {
+  if (!FEEDS[state.feedId].usesLocalReceiver) {
+    state.receiver = { lat: HOME.lat, lon: HOME.lon };
+    return;
+  }
   try {
     const r = await fetch(`${ADSB_BASE}/data/receiver.json`, { cache: "no-store" });
     const j = await r.json();
     if (typeof j.lat === "number" && typeof j.lon === "number") {
       state.receiver = { lat: j.lat, lon: j.lon };
+      state.homeKnown = true;
     }
-  } catch (e) { /* keep default */ }
+  } catch (e) { /* keep default/HOME */ }
+}
+
+function feedUrl(feed, built) {
+  // route CORS-less internet feeds through serve.py's allow-listed proxy
+  if (feed.proxy) return `${FEED_PROXY}?url=${encodeURIComponent(built.url)}`;
+  return built.url;
 }
 
 async function poll() {
   state.lastPollTry = Date.now();
+  const feed = FEEDS[state.feedId] || FEEDS.local;
   try {
-    const r = await fetch(`${ADSB_BASE}/data/aircraft.json`, { cache: "no-store" });
+    if (feed.needsKey && !state.rapidKey) throw new Error("RapidAPI key required");
+    const nm = RANGES_MI[state.rangeIdx] * MI_TO_NM;
+    const built = feed.build(state.receiver.lat, state.receiver.lon, nm);
+    const r = await fetch(feedUrl(feed, built), { cache: "no-store", headers: built.headers || {} });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
     const now = Date.now();
-    const serverNow = j.now ? j.now * 1000 : now;
-    for (const a of j.aircraft || []) {
+    const list = j[feed.array] || [];
+    for (const a of list) {
       if (typeof a.lat !== "number" || typeof a.lon !== "number") continue;
-      const hex = (a.hex || "").toUpperCase();
+      const hex = (a.hex || "").toUpperCase().replace(/^~/, ""); // ~ = TIS-B/non-ICAO
       if (!hex) continue;
       const seenPos = typeof a.seen_pos === "number" ? a.seen_pos : 0;
       let rec = state.aircraft.get(hex);
@@ -115,7 +199,8 @@ async function poll() {
       rec.callsign = (a.flight || "").trim();
       rec.altRaw = a.alt_baro;
       rec.gs = typeof a.gs === "number" ? a.gs : null;
-      rec.track = typeof a.track === "number" ? a.track : null;
+      rec.track = typeof a.track === "number" ? a.track
+        : (typeof a.true_heading === "number" ? a.true_heading : null);
       rec.lat = a.lat; rec.lon = a.lon;
       rec.seenPos = seenPos;
       rec.posClientTime = now - seenPos * 1000; // when this fix was actually valid
@@ -136,8 +221,15 @@ async function poll() {
         rec.trail.push({ e: m.east, n: m.north, t: now });
         if (rec.trail.length > 60) rec.trail.shift();
       }
-      // kick off enrichment lookups (cached + deduped)
-      resolveHex(hex);
+      // enrichment: internet feeds carry registration/type inline; local feed resolves
+      // them from the receiver's own database.
+      if (feed.inlineDb) {
+        if ((a.t || a.r) && !rec.typeData) {
+          rec.typeData = { t: a.t || null, r: a.r || null, desc: a.desc || null };
+        }
+      } else {
+        resolveHex(hex);
+      }
       if (rec.callsign) resolveRoute(rec.callsign);
     }
     // prune
@@ -571,9 +663,37 @@ function applyTheme() {
   coastKey = "";
 }
 function zoom(dir) {
+  const prev = state.rangeIdx;
   state.rangeIdx = Math.max(0, Math.min(RANGES_MI.length - 1, state.rangeIdx + dir));
-  coastKey = "";
+  if (state.rangeIdx !== prev) {
+    coastKey = "";
+    // internet feeds query by radius — re-poll so the new range is covered
+    if (FEEDS[state.feedId].kind === "readsb") poll();
+  }
 }
+
+async function switchFeed(id) {
+  if (!FEEDS[id]) return;
+  state.feedId = id;
+  if (LS) LS.setItem("radar.feed", id);
+  state.aircraft.clear();
+  state.closestHex = null;
+  state.lastPollOk = 0;
+  state.pollError = null;
+  updateFeedUi();
+  await loadReceiver();   // re-centre (local receiver vs HOME)
+  coastKey = "";          // coastline depends on centre
+  await poll();
+}
+
+function updateFeedUi() {
+  const feed = FEEDS[state.feedId];
+  const keyWrap = $("rapidkey-wrap");
+  if (keyWrap) keyWrap.style.display = feed.needsKey ? "block" : "none";
+  const sel = $("feed-select");
+  if (sel && sel.value !== state.feedId) sel.value = state.feedId;
+}
+
 function wireControls() {
   $("zoom-in").addEventListener("click", () => zoom(-1));
   $("zoom-out").addEventListener("click", () => zoom(1));
@@ -582,6 +702,30 @@ function wireControls() {
   const slider = $("phosphor");
   slider.addEventListener("input", () => { state.persistence = +slider.value; });
   window.addEventListener("resize", resize);
+
+  // feed selector
+  const sel = $("feed-select");
+  if (sel) {
+    sel.innerHTML = "";
+    for (const [id, f] of Object.entries(FEEDS)) {
+      const opt = document.createElement("option");
+      opt.value = id; opt.textContent = f.label;
+      sel.appendChild(opt);
+    }
+    sel.value = state.feedId;
+    sel.addEventListener("change", () => switchFeed(sel.value));
+  }
+  // RapidAPI key
+  const key = $("rapid-key");
+  if (key) {
+    key.value = state.rapidKey;
+    key.addEventListener("change", () => {
+      state.rapidKey = key.value.trim();
+      if (LS) LS.setItem("radar.rapidkey", state.rapidKey);
+      if (FEEDS[state.feedId].needsKey) poll();
+    });
+  }
+  updateFeedUi();
 }
 
 // ---- boot -----------------------------------------------------------------

@@ -99,6 +99,18 @@ html, body {
 .controls { margin-top: auto; display: flex; flex-direction: column; gap: 14px; }
 .ctl-group label { display: block; font-size: 11px; color: var(--mid); letter-spacing: 2px; margin-bottom: 6px; }
 input[type="range"] { width: 100%; accent-color: var(--base); }
+
+.feed-select, .key-input {
+  width: 100%; background: #000; color: var(--base);
+  border: 1px solid var(--mid); border-radius: 4px; padding: 8px 10px;
+  font-family: 'Share Tech Mono', monospace; font-size: 14px;
+  text-shadow: 0 0 5px var(--glow); -webkit-appearance: none; appearance: none;
+  box-shadow: inset 0 0 8px rgba(0,0,0,0.6); cursor: pointer; touch-action: manipulation;
+}
+.feed-select:focus, .key-input:focus { outline: none; border-color: var(--base); box-shadow: 0 0 8px var(--glow); }
+.feed-select option { background: #021006; color: var(--base); }
+.rapidkey-wrap { margin-top: 8px; }
+.key-input { cursor: text; }
 .themes { display: flex; gap: 10px; }
 .theme-btn {
   width: 38px; height: 38px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.25);

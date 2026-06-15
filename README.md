@@ -43,6 +43,33 @@ device URL in `index.html` (instructions below).
 
 ---
 
+## Feed sources (local vs internet)
+
+The **FEED SOURCE** dropdown in the panel lets you switch the data feed live, without
+reloading. Your choice is remembered in the browser (`localStorage`).
+
+| Feed | What it is | Works out of the box? |
+|------|-----------|------------------------|
+| **local ADS‑B receiver** (default) | Your own PiAware/SkyAware device. Most detail (full local aircraft DB). | Yes — via `serve.py` proxy, or with CORS enabled on the device. |
+| **airplanes.live** | Free community feed, no key. | Yes — it sends CORS headers, so it works even on a purely static host. |
+| **adsb.lol** | Free community feed, no key. | Only via the `serve.py` proxy (it has no CORS header). Use the launcher. |
+| **ADSBExchange (RapidAPI)** | Commercial feed. | Needs a [RapidAPI key](https://rapidapi.com/adsbx/api/adsbexchange-com1) — paste it into the **RapidAPI key** box that appears when selected. Routed via the `serve.py` proxy. |
+
+Internet feeds query a radius around your **home location** (not the device's reported
+position). Set your home coordinates in `index.html`:
+
+```html
+<script>window.RADAR_HOME = { lat: 54.76, lon: -6.35 };</script>
+```
+
+If you only ever use the local receiver, you can ignore this — it reads the location from
+`data/receiver.json` automatically.
+
+> **Note:** internet feeds cap the radius at 250 nm, so very large zoom levels are clamped.
+> Community APIs are rate‑limited; the page polls about once per second.
+
+---
+
 ## 1. Run locally (Mac / Windows / Linux)
 
 Requires only Python 3 (bundled with macOS/Linux; on Windows install from python.org).
@@ -221,6 +248,9 @@ Now `index.html` can be opened from any static host (including the device itself
 |---------|-------|---------|
 | ADS‑B data origin | `window.ADSB_BASE` in `index.html` | `/adsb` (via `serve.py`) |
 | Device URL for the proxy | `serve.py --device …` / `ADSB_DEVICE` env | `http://192.168.2.74:8080` |
+| Home location (internet feeds) | `window.RADAR_HOME` in `index.html` | auto from `data/receiver.json`, else 54.76, −6.35 |
+| Active feed | **FEED SOURCE** dropdown (saved in browser) | local ADS‑B receiver |
+| ADSBExchange key | **RapidAPI key** box (saved in browser) | — |
 | Bind host / port | `serve.py --host --port` | `127.0.0.1:8000` |
 | Default range, zoom steps | `RANGES_MI` / `DEFAULT_RANGE_IDX` in `radar.js` | `50` mi |
 | Receiver location | auto from `data/receiver.json` (falls back to 54.76, −6.35) | — |
@@ -233,6 +263,9 @@ Now `index.html` can be opened from any static host (including the device itself
 - **Flight number / route is `route unknown`** — adsbdb has no record for that callsign (common
   for GA, military, positioning flights). Altitude/speed/type still work from local data.
 - **Aircraft type blank** — the hex isn't in the local SkyAware database.
+- **`LINK FAIL: RapidAPI key required`** — you selected ADSBExchange; paste a RapidAPI key in the box.
+- **adsb.lol shows `LINK FAIL`** — that feed has no CORS header, so it only works through the
+  `serve.py` launcher (not on a static-only host). Use airplanes.live or run `serve.py`.
 
 ## Notes / credits
 
