@@ -84,6 +84,7 @@ const POLL_MS = 1000;                           // device refresh is ~1Hz
 const STALE_SEC = 15;                            // dim aircraft not seen for this long
 const DROP_SEC = 75;                             // remove entirely
 const MOVING_MIN_GS = 50;                        // kts; below this a target counts as not "moving"
+const LOCK_MAX_MS = 10 * 60 * 1000;              // auto-release a user lock after 10 minutes
 const DR_MAX_SEC = 4;                            // cap dead-reckoning extrapolation
 const SWEEP_PERIOD_MS = 4000;                    // sweep revolution time
 const PAINT_DECAY_MS = 1100;                     // how fast a painted target fades after the sweep passes
@@ -110,6 +111,7 @@ const state = {
   persistence: 55,         // phosphor burn amount; fixed default (higher = longer burn)
   closestHex: null,
   lockedHex: null,         // user-selected focus (click/touch); overrides auto-pick
+  lockTime: 0,             // when the current lock was set (for the 10-min auto-release)
   lastPollOk: 0,
   lastPollTry: 0,
   pollError: null,
@@ -118,13 +120,54 @@ const state = {
 };
 if (!FEEDS[state.feedId]) state.feedId = DEFAULT_FEED;
 
-const dbShardCache = new Map();   // prefix -> data (or null)
+// fetch() that always rejects after `timeoutMs` instead of hanging forever, so a
+// stalled receiver/feed/enrichment endpoint can never wedge a long-running kiosk.
+const FETCH_TIMEOUT_MS = 8000;
+async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Bounded TTL cache: caps entry count (oldest-inserted evicted) and expires
+// entries so a kiosk running for weeks never grows without bound. Negative
+// (null) results expire sooner so a transient lookup failure is retried, not
+// cached forever.
+function makeCache(maxEntries, posTtlMs, negTtlMs) {
+  const m = new Map();  // key -> {v, exp}
+  return {
+    has(k) {
+      const e = m.get(k);
+      if (!e) return false;
+      if (Date.now() > e.exp) { m.delete(k); return false; }
+      return true;
+    },
+    get(k) {
+      const e = m.get(k);
+      if (!e) return undefined;
+      if (Date.now() > e.exp) { m.delete(k); return undefined; }
+      return e.v;
+    },
+    set(k, v) {
+      m.set(k, { v, exp: Date.now() + (v == null ? negTtlMs : posTtlMs) });
+      if (m.size > maxEntries) m.delete(m.keys().next().value); // evict oldest
+    },
+  };
+}
+
+const dbShardCache = new Map();   // prefix -> data (or null); bounded (finite shards)
 const dbShardInflight = new Map();
-const hexCache = new Map();        // hex -> {r,t,desc} | null  (resolved aircraft)
+// hex -> {r,t,desc} | null  (resolved aircraft); bounded + TTL for long uptimes
+const hexCache = makeCache(4000, 24 * 3600 * 1000, 10 * 60 * 1000);
 const hexInflight = new Set();
 let typeTable = null;
 let friendlyTypes = null;          // ICAO designator -> "Boeing 787-9 Dreamliner"
-const routeCache = new Map();      // callsign -> route | null
+// callsign -> route | null; bounded + TTL (routes go stale across days)
+const routeCache = makeCache(4000, 12 * 3600 * 1000, 15 * 60 * 1000);
 const routeInflight = new Set();
 
 // ---- math -----------------------------------------------------------------
@@ -167,7 +210,7 @@ async function loadReceiver() {
     return;
   }
   try {
-    const r = await fetch(`${ADSB_BASE}/data/receiver.json`, { cache: "no-store" });
+    const r = await fetchWithTimeout(`${ADSB_BASE}/data/receiver.json`, { cache: "no-store" });
     const j = await r.json();
     if (typeof j.lat === "number" && typeof j.lon === "number") {
       state.receiver = { lat: j.lat, lon: j.lon };
@@ -182,18 +225,22 @@ function feedUrl(feed, built) {
   return built.url;
 }
 
+let pollInFlight = false;
 async function poll() {
+  if (pollInFlight) return;   // single-flight: never let polls stack up on a slow link
+  pollInFlight = true;
   state.lastPollTry = Date.now();
   const feed = FEEDS[state.feedId] || FEEDS.local;
   try {
     if (feed.needsKey && !state.rapidKey) throw new Error("RapidAPI key required");
     const nm = RANGES_MI[state.rangeIdx] * MI_TO_NM;
     const built = feed.build(state.receiver.lat, state.receiver.lon, nm);
-    const r = await fetch(feedUrl(feed, built), { cache: "no-store", headers: built.headers || {} });
+    const r = await fetchWithTimeout(feedUrl(feed, built), { cache: "no-store", headers: built.headers || {} });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
     const now = Date.now();
-    const list = j[feed.array] || [];
+    const list = j[feed.array];
+    if (!Array.isArray(list)) throw new Error("unexpected feed response"); // e.g. {error:…} with HTTP 200
     for (const a of list) {
       if (typeof a.lat !== "number" || typeof a.lon !== "number") continue;
       const hex = (a.hex || "").toUpperCase().replace(/^~/, ""); // ~ = TIS-B/non-ICAO
@@ -248,6 +295,15 @@ async function poll() {
     state.pollError = null;
   } catch (e) {
     state.pollError = e.message || String(e);
+  } finally {
+    // Prune even when a poll fails, so a feed outage doesn't leave ghost tracks
+    // lingering on screen for days (the successful-path prune above is a no-op
+    // here, but this guarantees cleanup keeps running during an outage too).
+    const dropNow = Date.now();
+    for (const [hex, rec] of state.aircraft) {
+      if (dropNow - rec.lastUpdate > DROP_SEC * 1000) state.aircraft.delete(hex);
+    }
+    pollInFlight = false;
   }
 }
 
@@ -257,7 +313,7 @@ async function fetchShard(prefix) {
   if (dbShardInflight.has(prefix)) return dbShardInflight.get(prefix);
   const p = (async () => {
     try {
-      const r = await fetch(`${ADSB_BASE}/db/${prefix}.json`, { cache: "force-cache" });
+      const r = await fetchWithTimeout(`${ADSB_BASE}/db/${prefix}.json`, { cache: "force-cache" });
       const data = r.ok ? await r.json() : null;
       dbShardCache.set(prefix, data);
       return data;
@@ -271,7 +327,7 @@ async function fetchShard(prefix) {
 async function loadTypeTable() {
   if (typeTable) return typeTable;
   try {
-    const r = await fetch(`${ADSB_BASE}/db/aircraft_types/icao_aircraft_types.json`, { cache: "force-cache" });
+    const r = await fetchWithTimeout(`${ADSB_BASE}/db/aircraft_types/icao_aircraft_types.json`, { cache: "force-cache" });
     typeTable = r.ok ? await r.json() : {};
   } catch (e) { typeTable = {}; }
   return typeTable;
@@ -282,7 +338,7 @@ async function loadTypeTable() {
 async function loadFriendlyTypes() {
   if (friendlyTypes) return friendlyTypes;
   try {
-    const r = await fetch("aircraft_types.json", { cache: "force-cache" });
+    const r = await fetchWithTimeout("aircraft_types.json", { cache: "force-cache" });
     friendlyTypes = r.ok ? await r.json() : {};
   } catch (e) { friendlyTypes = {}; }
   return friendlyTypes;
@@ -423,7 +479,7 @@ async function resolveHex(hex) {
 // adsbdb hex/reg -> aircraft type fallback when the local DB has no entry.
 async function resolveAircraftApi(hex) {
   try {
-    const r = await fetch(`${ADSBDB}/aircraft/${encodeURIComponent(hex)}`, { cache: "force-cache" });
+    const r = await fetchWithTimeout(`${ADSBDB}/aircraft/${encodeURIComponent(hex)}`, { cache: "force-cache" });
     if (!r.ok) return null;   // 404 = unknown airframe
     const j = await r.json();
     const ac = j && j.response && j.response.aircraft;
@@ -437,7 +493,7 @@ async function resolveRoute(callsign) {
   if (!cs || routeCache.has(cs) || routeInflight.has(cs)) return;
   routeInflight.add(cs);
   try {
-    const r = await fetch(`${ADSBDB}/callsign/${encodeURIComponent(cs)}`, { cache: "no-store" });
+    const r = await fetchWithTimeout(`${ADSBDB}/callsign/${encodeURIComponent(cs)}`, { cache: "no-store" });
     const j = await r.json();
     const fr = j && j.response && j.response.flightroute;
     if (fr) {
@@ -463,15 +519,31 @@ function isMoving(rec) {
   return true;
 }
 
+// true while the aircraft's (dead-reckoned) position falls inside the scope circle
+function onScope(rec, now) {
+  const p = effPos(rec, now);
+  const px = milesToPx(p.east, p.north);
+  return Math.hypot(px.x - CX, px.y - CY) <= R + 6;
+}
+
 function pickClosest() {
-  // a user-locked target keeps the focus until it lands or drops off radar
+  const now = Date.now();
+  // A user-locked target keeps the focus, but we release it (and fall back to
+  // auto-tracking the closest moving aircraft) once any of these happen:
+  //   - it disappears from radar,
+  //   - it stops moving / lands (isMoving == false),
+  //   - it drifts outside the scope circle, or
+  //   - the lock has been held for more than 10 minutes.
   if (state.lockedHex) {
     const locked = state.aircraft.get(state.lockedHex);
-    if (locked) { state.closestHex = locked.hex; return locked; }
-    state.lockedHex = null;   // dropped off radar — release the lock
+    const expired = now - (state.lockTime || 0) > LOCK_MAX_MS;
+    if (locked && !expired && isMoving(locked) && onScope(locked, now)) {
+      state.closestHex = locked.hex;
+      return locked;
+    }
+    state.lockedHex = null;   // released — resume auto-tracking the closest
   }
   let best = null, bestD = Infinity;
-  const now = Date.now();
   for (const rec of state.aircraft.values()) {
     if (rec.seenPos > STALE_SEC) continue;
     if (now - rec.lastUpdate > STALE_SEC * 1000) continue;
@@ -1061,6 +1133,7 @@ function wireControls() {
     }
     if (hit && bestD <= 6) {        // on (or within 6px of) an icon or its label
       state.lockedHex = hit.hex;    // always select the clicked aircraft (no toggle)
+      state.lockTime = Date.now();  // start the 10-minute auto-release timer
     } else {
       state.lockedHex = null;       // clicked clear space => release the lock
     }
@@ -1095,7 +1168,7 @@ function wireControls() {
 // ---- boot -----------------------------------------------------------------
 async function loadCoast() {
   try {
-    const r = await fetch("coastline.geojson", { cache: "force-cache" });
+    const r = await fetchWithTimeout("coastline.geojson", { cache: "force-cache" });
     const j = await r.json();
     const out = { coast: [], lake: [] };
     for (const f of j.features || []) {
@@ -1110,7 +1183,7 @@ async function loadCoast() {
 
 async function loadAirports() {
   try {
-    const r = await fetch("airports.json", { cache: "force-cache" });
+    const r = await fetchWithTimeout("airports.json", { cache: "force-cache" });
     const j = await r.json();
     state.airports = Array.isArray(j.airports) ? j.airports : [];
     coastKey = "";   // fold into the cached coast layer on next render
@@ -1121,12 +1194,21 @@ async function main() {
   wireControls();
   applyTheme();
   resize();
-  await loadReceiver();
+  // Start the animation loop immediately, before any network I/O, so a dead
+  // receiver/feed shows an animated "CONNECTING…/LINK FAIL" scope rather than a
+  // blank frozen screen on a kiosk that boots before the network is up.
+  requestAnimationFrame(frame);
   loadCoast();
   loadAirports();
   loadFriendlyTypes();
-  await poll();
-  setInterval(poll, POLL_MS);
-  requestAnimationFrame(frame);
+  await loadReceiver();   // best-effort scope centre (times out, won't hang boot)
+  pollLoop();
+}
+
+// Self-scheduling 1Hz poll: waits for each poll to settle before scheduling the
+// next, so polls never overlap or pile up (paired with poll()'s single-flight
+// guard, which also covers the manual poll() calls from the controls).
+function pollLoop() {
+  poll().finally(() => setTimeout(pollLoop, POLL_MS));
 }
 main();
