@@ -54,30 +54,12 @@
                    placeholder="RapidAPI key for ADSBExchange" />
           </div>
         </div>
-        <div class="ctl-group">
-          <label>PHOSPHOR BURN</label>
-          <input type="range" id="phosphor" min="0" max="100" value="55" />
-        </div>
-        <div class="ctl-group">
-          <label>SCOPE COLOUR</label>
-          <div class="themes">
-            <button class="theme-btn t-green"  data-theme="green"  aria-label="Green"></button>
-            <button class="theme-btn t-orange" data-theme="orange" aria-label="Orange"></button>
-            <button class="theme-btn t-blue"   data-theme="blue"   aria-label="Blue"></button>
-          </div>
-        </div>
       </div>
 
-      <p class="hint">Data: local ADS-B receiver · routes via adsbdb.com</p>
-      <div class="legend" id="legend">
-        <span><canvas class="leg-ic" data-kind="jet" width="34" height="34"></canvas>Jet</span>
-        <span><canvas class="leg-ic" data-kind="turboprop" width="34" height="34"></canvas>Turboprop</span>
-        <span><canvas class="leg-ic" data-kind="military" width="34" height="34"></canvas>Military</span>
-        <span><canvas class="leg-ic" data-kind="helicopter" width="34" height="34"></canvas>Heli</span>
-      </div>
+      <p class="hint">Data: local ADS-B receiver · routes via adsbdb.com · press C to change scope colour</p>
     </aside>
   </div>
-
+  <script>window.ADSB_BASE = "http://192.168.2.74:8080";</script>
   <script src="radar.js"></script>
 </body>
 </html>

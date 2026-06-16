@@ -31,7 +31,7 @@ html, body {
     radial-gradient(circle at center, rgba(255,255,255,0.03), transparent 60%),
     var(--bg);
 }
-#scope { display: block; width: 100%; height: 100%; }
+#scope { display: block; width: 100%; height: 100%; touch-action: none; }
 /* CRT scanlines + vignette */
 #scope-wrap::after {
   content: ""; position: absolute; inset: 0; pointer-events: none;
@@ -98,7 +98,6 @@ html, body {
 
 .controls { margin-top: auto; display: flex; flex-direction: column; gap: 14px; }
 .ctl-group label { display: block; font-size: 11px; color: var(--mid); letter-spacing: 2px; margin-bottom: 6px; }
-input[type="range"] { width: 100%; accent-color: var(--base); }
 
 .feed-select, .key-input {
   width: 100%; background: #000; color: var(--base);
@@ -111,28 +110,8 @@ input[type="range"] { width: 100%; accent-color: var(--base); }
 .feed-select option { background: #021006; color: var(--base); }
 .rapidkey-wrap { margin-top: 8px; }
 .key-input { cursor: text; }
-.themes { display: flex; gap: 10px; }
-.theme-btn {
-  width: 38px; height: 38px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.25);
-  cursor: pointer; touch-action: manipulation;
-}
-.theme-btn.t-green  { background: #33ff66; box-shadow: 0 0 10px rgba(51,255,102,.6); }
-.theme-btn.t-orange { background: #ffb000; box-shadow: 0 0 10px rgba(255,176,0,.6); }
-.theme-btn.t-blue   { background: #33ccff; box-shadow: 0 0 10px rgba(51,204,255,.6); }
-body[data-theme="green"]  .t-green,
-body[data-theme="orange"] .t-orange,
-body[data-theme="blue"]   .t-blue { border-color: #fff; }
 
 .hint { font-size: 10px; color: var(--mid); opacity: 0.7; margin: 4px 0 0; }
-.legend {
-  display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px;
-  padding-top: 8px; border-top: 1px solid var(--grid);
-}
-.legend span {
-  display: inline-flex; align-items: center; gap: 5px;
-  font-size: 11px; color: var(--mid); letter-spacing: 0.04em;
-}
-.leg-ic { width: 17px; height: 17px; }
 
 /* ---- responsive: stack on narrow / portrait screens ---- */
 @media (max-width: 760px), (orientation: portrait) {
@@ -140,4 +119,54 @@ body[data-theme="blue"]   .t-blue { border-color: #fff; }
   #panel { width: 100%; flex: 0 0 auto; border-left: none; border-top: 2px solid var(--mid); }
   .callsign-big { font-size: 36px; }
   .controls { margin-top: 12px; }
+}
+
+/* ---- square / round display (e.g. 5" 1080x1080 circular touch monitor) ----
+   The visible area is the inscribed circle, so the radar fills the whole square
+   and the side panel becomes an in-scope translucent HUD callout. Zoom controls
+   move to bottom-centre near the south pointer. This block follows the portrait
+   query on purpose so it overrides it for near-square viewports. */
+@media (min-aspect-ratio: 9/10) and (max-aspect-ratio: 10/9) {
+  #app { flex-direction: row; position: relative; }
+  #scope-wrap { flex: 1 1 auto; }
+
+  /* target readout overlaid inside the circle, on the left, vertically centred */
+  #panel {
+    position: absolute; z-index: 5; pointer-events: none;
+    left: 4.5%; top: 50%; transform: translateY(-50%);
+    width: 32%; min-width: 180px; max-width: 258px; flex: none;
+    background: rgba(2, 10, 5, 0.42);
+    border: 1px solid var(--mid); border-left: 1px solid var(--mid);
+    border-radius: 12px; padding: 10px 12px; gap: 2px;
+    box-shadow: 0 0 18px rgba(0,0,0,0.55), inset 0 0 26px rgba(0,0,0,0.45);
+    backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+  }
+  #panel .panel-title,
+  #panel .controls,
+  #panel .hint { display: none; }            /* HUD: target info only */
+  /* compact, smaller type so values don't wrap; callsign is no longer a big title */
+  .callsign-big { font-size: 19px; letter-spacing: 1px; margin-bottom: 2px; }
+  .readout { grid-template-columns: 62px 1fr; gap: 1px 6px; margin: 2px 0; }
+  .readout dt { font-size: 9px; }
+  .readout dd { font-size: 12px; }
+  #c-route { font-size: 13px; }
+
+  /* status: just "LIVE", centred below the N marker (no track count) */
+  #topbar { justify-content: center; top: 6%; left: 0; right: 0; }
+  #count { display: none; }
+
+  /* zoom: bottom-centre near the S pointer — no button circles, just + / − + scale */
+  #zoom-controls {
+    right: auto; left: 50%; bottom: 3.5%;
+    transform: translateX(-50%);
+    flex-direction: row-reverse; align-items: center; gap: 16px;
+  }
+  .rbtn {
+    width: auto; height: auto; min-width: 44px; min-height: 44px;
+    background: none; border: none; border-radius: 0; box-shadow: none;
+    font-size: 36px; color: var(--hot); opacity: 0.8; padding: 2px 8px;
+    text-shadow: 0 0 8px var(--glow);
+  }
+  .rbtn:active { transform: none; opacity: 1; box-shadow: none; }
+  .range-readout { font-size: 18px; opacity: 0.9; }
 }

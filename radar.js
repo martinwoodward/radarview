@@ -85,6 +85,8 @@ const STALE_SEC = 15;                            // dim aircraft not seen for th
 const DROP_SEC = 75;                             // remove entirely
 const MOVING_MIN_GS = 50;                        // kts; below this a target counts as not "moving"
 const DR_MAX_SEC = 4;                            // cap dead-reckoning extrapolation
+const SWEEP_PERIOD_MS = 4000;                    // sweep revolution time
+const PAINT_DECAY_MS = 1100;                     // how fast a painted target fades after the sweep passes
 const MI_PER_DEG_LAT = 69.172;                   // statute miles per degree latitude
 const KT_TO_MI_PER_SEC = 1.15078 / 3600;         // knots -> statute miles/second
 const MI_TO_NM = 1 / 1.15078;                    // statute miles -> nautical miles
@@ -105,12 +107,14 @@ const state = {
   aircraft: new Map(),     // hex -> record
   rangeIdx: DEFAULT_RANGE_IDX,
   theme: "green",
-  persistence: 55,         // 0..100 slider; higher = longer phosphor burn
+  persistence: 55,         // phosphor burn amount; fixed default (higher = longer burn)
   closestHex: null,
+  lockedHex: null,         // user-selected focus (click/touch); overrides auto-pick
   lastPollOk: 0,
   lastPollTry: 0,
   pollError: null,
   coast: null,             // {coast:[[ [lon,lat],.. ]], lake:[...] }
+  airports: null,          // [{name,code,lat,lon,cls}] cls 2=large 1=medium 0=airfield
 };
 if (!FEEDS[state.feedId]) state.feedId = DEFAULT_FEED;
 
@@ -119,6 +123,7 @@ const dbShardInflight = new Map();
 const hexCache = new Map();        // hex -> {r,t,desc} | null  (resolved aircraft)
 const hexInflight = new Set();
 let typeTable = null;
+let friendlyTypes = null;          // ICAO designator -> "Boeing 787-9 Dreamliner"
 const routeCache = new Map();      // callsign -> route | null
 const routeInflight = new Set();
 
@@ -272,6 +277,25 @@ async function loadTypeTable() {
   return typeTable;
 }
 
+// Bundled ICAO Doc 8643 lookup: designator -> friendly name (works on every feed,
+// incl. the local receiver feed which otherwise only carries the engine code).
+async function loadFriendlyTypes() {
+  if (friendlyTypes) return friendlyTypes;
+  try {
+    const r = await fetch("aircraft_types.json", { cache: "force-cache" });
+    friendlyTypes = r.ok ? await r.json() : {};
+  } catch (e) { friendlyTypes = {}; }
+  return friendlyTypes;
+}
+
+// Friendly aircraft name for an ICAO type designator, e.g. "B789" -> "Boeing
+// 787-9 Dreamliner". Falls back to the raw designator when unknown.
+function friendlyType(t) {
+  if (!t) return null;
+  const code = t.toUpperCase();
+  return (friendlyTypes && friendlyTypes[code]) || t;
+}
+
 // ---- aircraft kind classification (for the icon) --------------------------
 // ICAO type designators that are (almost always) military, so we can show a
 // fighter/military icon even when the engine descriptor says "jet/turboprop".
@@ -293,6 +317,21 @@ const MIL_TYPES = new Set([
   // military UAV
   "RQ4", "MQ9", "MQ1", "MQ4", "GHWK",
 ]);
+
+// Per-registration icon overrides for local aircraft the feeds mis-type or can't
+// resolve. Key = registration with dashes/spaces stripped, upper-case.
+const REG_OVERRIDES = new Map([
+  ["GJMRT", "piston"],      // Comco Ikarus C42 microlight (Newtownards)
+  ["GPSNI", "helicopter"],  // PSNI Eurocopter EC135
+  ["GPSNO", "helicopter"],  // PSNI Eurocopter EC145
+  ["N980SN", "turboprop"],  // Daher TBM 700 (single turboprop)
+]);
+// Per-hex (Mode S) icon overrides for airframes absent from every DB and not
+// broadcasting a usable type/emitter-category. Key = hex, upper-case.
+const HEX_OVERRIDES = new Map([
+  ["4624A2", "helicopter"],
+]);
+const normReg = (r) => (r || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 function descToKind(code) {
   // ICAO descriptor code like "L2J" (type / #engines / engine kind)
@@ -318,6 +357,10 @@ async function typeToDesc(t) {
 // decide which icon to use for a record; stored on rec.iconKind (async).
 async function classifyIcon(rec) {
   const td = rec.typeData || {};
+  // explicit overrides win: hex (most specific) then registration
+  if (rec.hex && HEX_OVERRIDES.has(rec.hex.toUpperCase())) { rec.iconKind = HEX_OVERRIDES.get(rec.hex.toUpperCase()); return; }
+  const reg = normReg(td.r);
+  if (reg && REG_OVERRIDES.has(reg)) { rec.iconKind = REG_OVERRIDES.get(reg); return; }
   const t = td.t || null;
   // military wins (so a C-130 reads "military", not "turboprop")
   if (rec.mil || (t && MIL_TYPES.has(t.toUpperCase()))) {
@@ -360,13 +403,35 @@ async function resolveHex(hex) {
       hexCache.set(hex, out);
       const rec = state.aircraft.get(hex); if (rec) { rec.typeData = out; classifyIcon(rec); }
     } else {
-      hexCache.set(hex, null);
+      // local DB doesn't know this airframe (common for GA / police / military);
+      // fall back to adsbdb's registration->type lookup so we can still classify it.
+      const api = await resolveAircraftApi(hex);
+      if (api && (api.t || api.r)) {
+        const out = { r: api.r || null, t: api.t || null, desc: null };
+        if (out.t) { const tt = await loadTypeTable(); if (tt[out.t.toUpperCase()]) out.desc = tt[out.t.toUpperCase()].desc; }
+        hexCache.set(hex, out);
+        const rec = state.aircraft.get(hex); if (rec) { rec.typeData = out; classifyIcon(rec); }
+      } else {
+        hexCache.set(hex, null);
+      }
     }
   } catch (e) { hexCache.set(hex, null); }
   finally { hexInflight.delete(hex); }
 }
 
 // ---- callsign -> route (adsbdb) -------------------------------------------
+// adsbdb hex/reg -> aircraft type fallback when the local DB has no entry.
+async function resolveAircraftApi(hex) {
+  try {
+    const r = await fetch(`${ADSBDB}/aircraft/${encodeURIComponent(hex)}`, { cache: "force-cache" });
+    if (!r.ok) return null;   // 404 = unknown airframe
+    const j = await r.json();
+    const ac = j && j.response && j.response.aircraft;
+    if (!ac) return null;
+    return { r: ac.registration || null, t: ac.icao_type || null };
+  } catch (e) { return null; }
+}
+
 async function resolveRoute(callsign) {
   const cs = callsign.trim();
   if (!cs || routeCache.has(cs) || routeInflight.has(cs)) return;
@@ -399,6 +464,12 @@ function isMoving(rec) {
 }
 
 function pickClosest() {
+  // a user-locked target keeps the focus until it lands or drops off radar
+  if (state.lockedHex) {
+    const locked = state.aircraft.get(state.lockedHex);
+    if (locked) { state.closestHex = locked.hex; return locked; }
+    state.lockedHex = null;   // dropped off radar — release the lock
+  }
   let best = null, bestD = Infinity;
   const now = Date.now();
   for (const rec of state.aircraft.values()) {
@@ -466,6 +537,24 @@ function renderCoastOffscreen() {
   c.beginPath(); c.arc(CX, CY, R, 0, Math.PI * 2); c.clip();
   drawSet(state.coast.coast || [], 0.85, 1.1);
   drawSet(state.coast.lake || [], 0.7, 1.0);
+  // airports & airfields as dots (larger/brighter for bigger airports)
+  for (const a of state.airports || []) {
+    const m = toMiles(a.lat, a.lon);
+    const p = milesToPx(m.east, m.north);
+    if (Math.hypot(p.x - CX, p.y - CY) > R) continue;
+    if (a.cls >= 2) {                       // large airport: bright dot + ring
+      c.globalAlpha = 0.95; c.fillStyle = col.base;
+      c.beginPath(); c.arc(p.x, p.y, 2.6, 0, Math.PI * 2); c.fill();
+      c.globalAlpha = 0.5; c.strokeStyle = col.base; c.lineWidth = 1;
+      c.beginPath(); c.arc(p.x, p.y, 4.6, 0, Math.PI * 2); c.stroke();
+    } else if (a.cls === 1) {               // medium airport
+      c.globalAlpha = 0.8; c.fillStyle = col.mid;
+      c.beginPath(); c.arc(p.x, p.y, 2.0, 0, Math.PI * 2); c.fill();
+    } else {                                // small airfield: faint, like the coastline
+      c.globalAlpha = 0.85; c.fillStyle = col.dim;
+      c.beginPath(); c.arc(p.x, p.y, 1.2, 0, Math.PI * 2); c.fill();
+    }
+  }
   c.restore();
   c.globalAlpha = 1;
 }
@@ -508,7 +597,7 @@ function drawGrid() {
 
 let sweepAngle = 0;
 function drawSweep(dt) {
-  sweepAngle = (sweepAngle + dt * (Math.PI * 2) / 4000) % (Math.PI * 2); // 4s revolution
+  sweepAngle = (sweepAngle + dt * (Math.PI * 2) / SWEEP_PERIOD_MS) % (Math.PI * 2);
   const col = themeColors();
   ctx.save();
   ctx.translate(CX, CY);
@@ -537,6 +626,28 @@ function hexA(hex, a) {
   const h = hex.replace("#", "");
   const n = parseInt(h.length === 3 ? h.split("").map(c => c + c).join("") : h, 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+function rgbOf(hex) {
+  const h = hex.replace("#", "");
+  const n = parseInt(h.length === 3 ? h.split("").map(c => c + c).join("") : h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function lerpColor(h1, h2, t) {
+  const a = rgbOf(h1), b = rgbOf(h2);
+  const m = i => Math.round(a[i] + (b[i] - a[i]) * t);
+  return `rgb(${m(0)},${m(1)},${m(2)})`;
+}
+
+// 0..1 "paint" intensity for a screen point: 1 just as the sweep crosses it,
+// decaying as the sweep moves on, back to ~0 before it comes round again.
+function sweepGlow(px, py) {
+  const ang = Math.atan2(px - CX, CY - py);          // 0 = north, increasing clockwise
+  let behind = (sweepAngle - ang) % (Math.PI * 2);
+  if (behind < 0) behind += Math.PI * 2;
+  const sinceMs = (behind / (Math.PI * 2)) * SWEEP_PERIOD_MS;
+  return Math.exp(-sinceMs / PAINT_DECAY_MS);
 }
 
 function effPos(rec, now) {
@@ -711,17 +822,21 @@ function placeLabels(labels) {
   }
 }
 
+let hitTargets = [];   // rebuilt each frame: clickable {hex, x, y, r} icons + {hex, isLabel, box} labels
 function drawAircraft(now) {
   const col = themeColors();
   const range = RANGES_MI[state.rangeIdx];
   const lineH = 13, charW = 6.4;
   const labels = [];
+  hitTargets = [];
   for (const rec of state.aircraft.values()) {
     const p = effPos(rec, now);
     const px = milesToPx(p.east, p.north);
     if (Math.hypot(px.x - CX, px.y - CY) > R + 6) continue; // outside scope
     const stale = rec.seenPos > STALE_SEC || (now - rec.lastUpdate > STALE_SEC * 1000);
     const isClosest = rec.hex === state.closestHex;
+    // register the icon as a clickable target (generous radius, matches what's drawn)
+    hitTargets.push({ hex: rec.hex, x: px.x, y: px.y, r: isClosest ? 16 : 14 });
     // trail
     if (rec.trail.length > 1) {
       for (let i = 1; i < rec.trail.length; i++) {
@@ -732,22 +847,42 @@ function drawAircraft(now) {
         ctx.beginPath(); ctx.moveTo(q0.x, q0.y); ctx.lineTo(q1.x, q1.y); ctx.stroke();
       }
     }
-    // plane icon, pointing along its track
-    const fill = stale ? hexA(col.mid, 0.55) : col.hot;
+    // plane icon, pointing along its track. Targets keep a clearly-visible
+    // resting brightness (so they stay easy to see and click) and brighten
+    // further as the sweep line paints over them, then settle back.
+    let glow = stale ? 0 : Math.max(0.45, sweepGlow(px.x, px.y));
+    if (isClosest) glow = Math.max(glow, 0.7);        // keep the focus target legible
+    const fill = stale ? hexA(col.mid, 0.55) : lerpColor(col.mid, col.hot, glow);
     const s = isClosest ? 10 : 7;
     if (rec.track != null || rec.iconKind) drawPlaneIcon(ctx, px.x, px.y, rec.track, s, fill, rec.iconKind);
     else { ctx.fillStyle = fill; ctx.beginPath(); ctx.arc(px.x, px.y, s * 0.45, 0, Math.PI * 2); ctx.fill(); }
     if (isClosest) {
       ctx.strokeStyle = col.hot; ctx.lineWidth = 1.5;
       ctx.strokeRect(px.x - 13, px.y - 13, 26, 26);
+      // corner ticks mark a user-locked (pinned) target
+      if (rec.hex === state.lockedHex) {
+        const L = 13, t = 5;
+        ctx.beginPath();
+        for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+          ctx.moveTo(px.x + sx * L, px.y + sy * (L - t));
+          ctx.lineTo(px.x + sx * L, px.y + sy * L);
+          ctx.lineTo(px.x + sx * (L - t), px.y + sy * L);
+        }
+        ctx.stroke();
+      }
     }
     // collect label (declutter: only closest, or all when zoomed in <= 50mi)
     if (isClosest || range <= 50) {
-      const lines = [rec.callsign || rec.hex];
+      const td = rec.typeData || hexCache.get(rec.hex) || null;
+      const typeStr = (isClosest && td && td.t) ? td.t : null;  // aircraft type, above the flight no.
+      const lines = [];
+      if (typeStr) lines.push(typeStr);
+      lines.push(rec.callsign || rec.hex);
       if (isClosest && typeof rec.altRaw === "number") lines.push(fmtAlt(rec.altRaw));
       const w = Math.max(...lines.map(t => t.length)) * charW;
       labels.push({
-        ax: px.x + s + 6, ay: px.y - 8, w, h: lines.length * lineH,
+        hex: rec.hex,
+        ax: px.x + s + 6, ay: px.y - 8 - (typeStr ? lineH : 0), w, h: lines.length * lineH,
         lines, isClosest,
         color: stale ? hexA(col.mid, 0.6) : (isClosest ? col.hot : col.base),
       });
@@ -758,6 +893,9 @@ function drawAircraft(now) {
   ctx.font = "13px 'VT323', monospace";
   ctx.textBaseline = "top";
   for (const lb of labels) {
+    // the rendered label is also a clickable target for its aircraft
+    hitTargets.push({ hex: lb.hex, isLabel: true,
+      box: { x: lb.x - 3, y: lb.y - 2, w: lb.w + 6, h: lb.h + 4 } });
     ctx.fillStyle = lb.color;
     for (let i = 0; i < lb.lines.length; i++) ctx.fillText(lb.lines[i], lb.x, lb.y + i * lineH);
   }
@@ -773,24 +911,32 @@ function drawCenter() {
 }
 
 let lastFrame = performance.now();
+let frameErrLogged = false;
 function frame(t) {
-  const dt = Math.min(60, t - lastFrame); lastFrame = t;
-  const now = Date.now();
-  // phosphor persistence: fade previous frame toward black
-  const fade = 0.30 - (state.persistence / 100) * 0.28; // 0.30 .. 0.02
-  ctx.fillStyle = `rgba(0,8,2,${fade})`;
-  ctx.fillRect(0, 0, W, H);
+  // A thrown error must never kill the animation loop: if rendering one frame
+  // fails (transient bad data, etc.) we log it once and keep going, so the scope
+  // never freezes (a frozen scope also stops click/lock feedback from showing).
+  try {
+    const dt = Math.min(60, t - lastFrame); lastFrame = t;
+    const now = Date.now();
+    // phosphor persistence: fade previous frame toward black
+    const fade = 0.30 - (state.persistence / 100) * 0.28; // 0.30 .. 0.02
+    ctx.fillStyle = `rgba(0,8,2,${fade})`;
+    ctx.fillRect(0, 0, W, H);
 
-  renderCoastOffscreen();
-  if (coastCanvas) ctx.drawImage(coastCanvas, 0, 0, W, H);
+    renderCoastOffscreen();
+    if (coastCanvas) ctx.drawImage(coastCanvas, 0, 0, W, H);
 
-  drawGrid();
-  drawSweep(dt);
-  pickClosest();
-  drawAircraft(now);
-  drawCenter();
+    drawGrid();
+    drawSweep(dt);
+    pickClosest();
+    drawAircraft(now);
+    drawCenter();
 
-  updateHud(now);
+    updateHud(now);
+  } catch (e) {
+    if (!frameErrLogged) { console.error("radar frame error:", e); frameErrLogged = true; }
+  }
   requestAnimationFrame(frame);
 }
 
@@ -822,35 +968,29 @@ function updateHud(now) {
   setText("c-callsign", rec.callsign || rec.hex);
   setText("c-flight", route && route.flightNo ? route.flightNo : (rec.callsign ? "(no IATA)" : null));
   setText("c-airline", route ? route.airline : null);
-  setText("c-type", td && td.t ? (td.t + (td.desc ? " · " + td.desc : "")) : null);
+  setText("c-type", td && td.t ? friendlyType(td.t) : null);
   setText("c-reg", td ? td.r : null);
   setText("c-alt", fmtAlt(rec.altRaw));
   setText("c-gs", rec.gs != null ? Math.round(rec.gs) + " kts" : null);
   if (route && (route.depIata || route.arrIata)) {
     setText("c-route", `${route.depIata || "???"} → ${route.arrIata || "???"}`);
   } else { setText("c-route", rec.callsign ? "route unknown" : null); }
-  setText("c-pos", `${rec.distMi.toFixed(1)} mi · ${Math.round(rec.brng)}° ${compass(rec.brng)}`);
+  setText("c-pos", typeof rec.distMi === "number" && typeof rec.brng === "number"
+    ? `${rec.distMi.toFixed(1)} mi · ${Math.round(rec.brng)}° ${compass(rec.brng)}`
+    : null);
 }
 
 // ---- controls -------------------------------------------------------------
 function applyTheme() {
   document.body.dataset.theme = state.theme;
   coastKey = "";
-  drawLegend();
 }
 
-// render the icon legend swatches in the current theme colour
-function drawLegend() {
-  const hot = themeColors().hot;
-  document.querySelectorAll(".leg-ic").forEach(cv => {
-    const g = cv.getContext("2d");
-    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-    const size = 34;
-    cv.width = size * dpr; cv.height = size * dpr;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, size, size);
-    drawPlaneIcon(g, size / 2, size / 2, 0, 11, hot, cv.dataset.kind);
-  });
+// cycle scope colour green -> orange -> blue -> green (bound to the "c" key)
+function cycleTheme() {
+  const order = Object.keys(THEMES);
+  state.theme = order[(order.indexOf(state.theme) + 1) % order.length];
+  applyTheme();
 }
 function zoom(dir) {
   const prev = state.rangeIdx;
@@ -868,6 +1008,7 @@ async function switchFeed(id) {
   if (LS) LS.setItem("radar.feed", id);
   state.aircraft.clear();
   state.closestHex = null;
+  state.lockedHex = null;
   state.lastPollOk = 0;
   state.pollError = null;
   updateFeedUi();
@@ -887,11 +1028,44 @@ function updateFeedUi() {
 function wireControls() {
   $("zoom-in").addEventListener("click", () => zoom(-1));
   $("zoom-out").addEventListener("click", () => zoom(1));
-  document.querySelectorAll(".theme-btn").forEach(b =>
-    b.addEventListener("click", () => { state.theme = b.dataset.theme; applyTheme(); }));
-  const slider = $("phosphor");
-  slider.addEventListener("input", () => { state.persistence = +slider.value; });
+  // "c" cycles the scope colour (ignored while typing in a control)
+  window.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+    if (e.key === "c" || e.key === "C") cycleTheme();
+  });
   window.addEventListener("resize", resize);
+
+  // click / tap a target (its icon OR its label) to lock focus on it; auto-pick
+  // is suspended until that aircraft drops off radar. Click empty space to release.
+  // Hit-tests the exact icons/labels drawn last frame so what you see is what you can
+  // click. Press Escape to release too. Bound to "click" (not "pointerdown"): some
+  // browser/extension setups never dispatch pointer events to the canvas, whereas the
+  // synthesised "click" is reliable everywhere and also avoids selects mid-drag.
+  canvas.style.cursor = "crosshair";
+  canvas.addEventListener("click", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let hit = null, bestD = Infinity;
+    for (const t of hitTargets) {
+      let d;
+      if (t.isLabel) {
+        const b = t.box;                       // distance to label rectangle (0 if inside)
+        const dx = Math.max(b.x - x, 0, x - (b.x + b.w));
+        const dy = Math.max(b.y - y, 0, y - (b.y + b.h));
+        d = Math.hypot(dx, dy);
+      } else {
+        d = Math.hypot(t.x - x, t.y - y) - t.r;   // inside the icon radius => negative
+      }
+      if (d < bestD) { bestD = d; hit = t; }
+    }
+    if (hit && bestD <= 6) {        // on (or within 6px of) an icon or its label
+      state.lockedHex = hit.hex;    // always select the clicked aircraft (no toggle)
+    } else {
+      state.lockedHex = null;       // clicked clear space => release the lock
+    }
+  });
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape") state.lockedHex = null; });
 
   // feed selector
   const sel = $("feed-select");
@@ -934,12 +1108,23 @@ async function loadCoast() {
   } catch (e) { /* coastline optional */ }
 }
 
+async function loadAirports() {
+  try {
+    const r = await fetch("airports.json", { cache: "force-cache" });
+    const j = await r.json();
+    state.airports = Array.isArray(j.airports) ? j.airports : [];
+    coastKey = "";   // fold into the cached coast layer on next render
+  } catch (e) { /* airports optional */ }
+}
+
 async function main() {
   wireControls();
   applyTheme();
   resize();
   await loadReceiver();
   loadCoast();
+  loadAirports();
+  loadFriendlyTypes();
   await poll();
   setInterval(poll, POLL_MS);
   requestAnimationFrame(frame);

@@ -15,9 +15,8 @@ Features:
 - **Type-aware aircraft icons** — distinct silhouettes for jets, turboprops, military aircraft
   and helicopters (with a legend in the panel), each rotated to its heading.
 - Touch‑friendly **zoom +/−** buttons cycling `12.5 / 25 / 50 / 100 / 200` miles (default **50**).
-- **Colour themes**: green, orange, blue.
-- Adjustable **phosphor burn** (afterglow persistence) slider.
-- Coastline + lakes outline (Natural Earth) drawn in the radar style.
+- **Colour themes**: green, orange, blue — press **C** to cycle.
+- Coastline + lakes outline (Natural Earth) and airports/airfields (OurAirports) drawn as dots in the radar style.
 - Smooth motion via dead‑reckoning between the receiver's 1 Hz updates; stale targets dim out.
 
 ## Data sources
@@ -27,9 +26,10 @@ Features:
 | Positions, altitude, groundspeed, track | `<device>/data/aircraft.json` |
 | Receiver location | `<device>/data/receiver.json` |
 | Aircraft type & registration | `<device>/db/…` (local SkyAware database) |
+| Friendly aircraft names (e.g. `B789` → Boeing 787-9 Dreamliner) | `aircraft_types.json` (bundled ICAO Doc 8643 table) |
 | Flight number, airline, dep/arr airports | `https://api.adsbdb.com` (public, CORS‑enabled) |
 
-The radar page is **static** (`index.html`, `radar.css`, `radar.js`, `coastline.geojson`).
+The radar page is **static** (`index.html`, `radar.css`, `radar.js`, `coastline.geojson`, `airports.json`, `aircraft_types.json`).
 The only wrinkle is CORS: by default the ADS‑B device does **not** send an
 `Access-Control-Allow-Origin` header, so a browser on another origin can't read its JSON.
 There are two ways to solve that — pick **one**:
@@ -201,6 +201,11 @@ sudo reboot
 > force X11 by setting **Advanced Options → Wayland → X11** in `sudo raspi-config`, then reboot.
 > To exit kiosk mode, press **Alt+F4** or **Ctrl+W** (or SSH in and `sudo systemctl restart lightdm`).
 
+> **Round / square displays (e.g. a 5″ 1080×1080 circular touch monitor):** when the viewport
+> is roughly square the page auto‑switches to a round‑scope layout — the radar fills the whole
+> screen (inscribed circle), the target readout becomes a translucent in‑scope HUD callout, and
+> the **+ / −** zoom buttons move to the bottom‑centre next to the south pointer. No config needed.
+
 ---
 
 ## Enable CORS on the ADS‑B device
@@ -274,4 +279,9 @@ Now `index.html` can be opened from any static host (including the device itself
 - Routes & airline data: [adsbdb.com](https://www.adsbdb.com) (free public API).
 - Coastline & lakes: [Natural Earth](https://www.naturalearthdata.com) (public domain),
   clipped to the British Isles region in `coastline.geojson`.
+- Airports & airfields: [OurAirports](https://ourairports.com/data/) (public domain),
+  filtered to within range of the receiver in `airports.json`.
+- Aircraft type names: ICAO Doc 8643 designators, condensed to one friendly
+  name per type in `aircraft_types.json` (e.g. `B789` → "Boeing 787-9 Dreamliner",
+  `C17` → "Boeing C-17 Globemaster III").
 - No build step, no npm, no external JS libraries — just open it.
