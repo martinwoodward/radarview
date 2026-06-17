@@ -116,6 +116,7 @@ const state = {
   lastPollTry: 0,
   pollError: null,
   coast: null,             // {coast:[[ [lon,lat],.. ]], lake:[...] }
+  ctr: null,               // UK control zones: [[ [lon,lat],.. ]] closed rings
   airports: null,          // [{name,code,lat,lon,cls}] cls 2=large 1=medium 0=airfield
 };
 if (!FEEDS[state.feedId]) state.feedId = DEFAULT_FEED;
@@ -609,6 +610,23 @@ function renderCoastOffscreen() {
   c.beginPath(); c.arc(CX, CY, R, 0, Math.PI * 2); c.clip();
   drawSet(state.coast.coast || [], 0.85, 1.1);
   drawSet(state.coast.lake || [], 0.7, 1.0);
+  // UK control zones: faint dotted outlines (CTR boundaries)
+  if (state.ctr && state.ctr.length) {
+    c.save();
+    c.strokeStyle = col.mid; c.globalAlpha = 0.55; c.lineWidth = 1;
+    c.lineJoin = "round"; c.lineCap = "round";
+    c.setLineDash([1, 4]);
+    for (const ring of state.ctr) {
+      c.beginPath();
+      for (let i = 0; i < ring.length; i++) {
+        const m = toMiles(ring[i][1], ring[i][0]);
+        const p = milesToPx(m.east, m.north);
+        if (i === 0) c.moveTo(p.x, p.y); else c.lineTo(p.x, p.y);
+      }
+      c.stroke();
+    }
+    c.restore();
+  }
   // airports & airfields as dots (larger/brighter for bigger airports)
   for (const a of state.airports || []) {
     const m = toMiles(a.lat, a.lon);
@@ -1181,6 +1199,22 @@ async function loadCoast() {
   } catch (e) { /* coastline optional */ }
 }
 
+// UK control zones (CTR boundaries) as closed [lon,lat] rings, drawn dotted.
+async function loadCtr() {
+  try {
+    const r = await fetchWithTimeout("controlzones.geojson", { cache: "force-cache" });
+    const j = await r.json();
+    let segs = [];
+    for (const f of j.features || []) {
+      if (f.properties && f.properties.kind === "ctr") {
+        segs = (f.geometry && f.geometry.coordinates) || [];
+      }
+    }
+    state.ctr = segs;
+    coastKey = "";   // fold into the cached coast layer on next render
+  } catch (e) { /* control zones optional */ }
+}
+
 async function loadAirports() {
   try {
     const r = await fetchWithTimeout("airports.json", { cache: "force-cache" });
@@ -1199,6 +1233,7 @@ async function main() {
   // blank frozen screen on a kiosk that boots before the network is up.
   requestAnimationFrame(frame);
   loadCoast();
+  loadCtr();
   loadAirports();
   loadFriendlyTypes();
   await loadReceiver();   // best-effort scope centre (times out, won't hang boot)

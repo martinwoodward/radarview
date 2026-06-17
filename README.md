@@ -27,9 +27,10 @@ Features:
 | Receiver location | `<device>/data/receiver.json` |
 | Aircraft type & registration | `<device>/db/…` (local SkyAware database) |
 | Friendly aircraft names (e.g. `B789` → Boeing 787-9 Dreamliner) | `aircraft_types.json` (bundled ICAO Doc 8643 table) |
+| UK control zones (dotted outlines) | `controlzones.geojson` (bundled CTR boundaries) |
 | Flight number, airline, dep/arr airports | `https://api.adsbdb.com` (public, CORS‑enabled) |
 
-The radar page is **static** (`index.html`, `radar.css`, `radar.js`, `coastline.geojson`, `airports.json`, `aircraft_types.json`).
+The radar page is **static** (`index.html`, `radar.css`, `radar.js`, `coastline.geojson`, `controlzones.geojson`, `airports.json`, `aircraft_types.json`).
 The only wrinkle is CORS: by default the ADS‑B device does **not** send an
 `Access-Control-Allow-Origin` header, so a browser on another origin can't read its JSON.
 There are two ways to solve that — pick **one**:
@@ -281,6 +282,8 @@ Now `index.html` can be opened from any static host (including the device itself
   clipped to the British Isles region in `coastline.geojson`.
 - Airports & airfields: [OurAirports](https://ourairports.com/data/) (public domain),
   filtered to within range of the receiver in `airports.json`.
+- UK control zones: CTR boundaries from the UK AIP via the [YAIXM dataset](https://github.com/ahsparrow/airspace)
+  (Alan Sparrow), tessellated to closed rings in `controlzones.geojson` and drawn as dotted outlines.
 - Aircraft type names: ICAO Doc 8643 designators, condensed to one friendly
   name per type in `aircraft_types.json` (e.g. `B789` → "Boeing 787-9 Dreamliner",
   `C17` → "Boeing C-17 Globemaster III").
